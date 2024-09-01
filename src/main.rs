@@ -3,19 +3,18 @@
 use std::{
     cmp::Reverse,
     collections::HashMap,
-    fmt::format,
     fs::{self, create_dir_all, File},
     io::{BufReader, BufWriter, Write},
     iter,
     path::{Path, PathBuf},
     process::Command,
-    str::FromStr,
 };
 
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use clap::Parser;
 use exif::{In, Tag, Value};
 use inotify::{Inotify, WatchMask};
+use itertools::Itertools as _;
 
 #[derive(Parser)]
 struct Args {
@@ -170,7 +169,55 @@ fn generate(options: &Options) {
 
     dbg!(&photos_by_day);
 
-    let mut body: Vec<_> = photos_by_day
+    let mut photos_by_day: Vec<_> = photos_by_day.into_iter().collect();
+    photos_by_day.sort_by_key(|k| Reverse(k.0));
+
+    let mut page_num_photo = 0;
+    const MAX_NUM_PHOTO_PER_PAGE: usize = 50;
+    let pages = photos_by_day.split(|(_, v)| {
+        page_num_photo += v.len();
+        if page_num_photo > MAX_NUM_PHOTO_PER_PAGE {
+            page_num_photo = v.len();
+            true
+        } else {
+            false
+        }
+    });
+    let (pages_, pages) = pages.tee();
+
+    let nav: String = iter::once("<hr>\n<ul class=\"nav\">\n".to_owned())
+        .chain(pages_.enumerate().map(|(index, page)| {
+            let (start_date, _) = page.last().unwrap();
+            let (end_date, _) = page.first().unwrap();
+            let text = if start_date < end_date {
+                format!("{:?}–{:?}", start_date, end_date)
+            } else {
+                assert!(start_date == end_date);
+                format!("{:?}", start_date)
+            };
+            let path = page_path(index);
+            format!("<li><a href=\"{path}\">{text}</a></li>\n")
+        }))
+        .chain(iter::once("</ul>\n".to_owned()))
+        .collect();
+
+    for (index, photos_by_day) in pages.enumerate() {
+        generate_page(photos_by_day, options, index, &nav);
+    }
+}
+
+fn page_path(index: usize) -> String {
+    format!("page_{index}.html")
+}
+
+fn generate_page(
+    photos_by_day: &[(NaiveDate, Vec<Photo>)],
+    options: &Options,
+    index: usize,
+    nav: &str,
+) {
+    let path = page_path(index);
+    let body: Vec<_> = photos_by_day
         .iter()
         .map(|(date, v)| {
             (
@@ -191,14 +238,14 @@ fn generate(options: &Options) {
         })
         .collect();
 
-    body.sort_by_key(|k| Reverse(k.0));
-    let body = body.into_iter().map(|(_, i)| i).flatten();
+    let body: Vec<String> = body.into_iter().map(|(_, i)| i).flatten().collect();
 
-    let html = iter::once(HTML_BEGIN.to_owned())
-        .chain(body)
-        .chain(iter::once(HTML_END.to_owned()));
+    let html = iter::once(HTML_BEGIN)
+        .chain(body.iter().map(|s| &**s))
+        .chain(iter::once(nav))
+        .chain(iter::once(HTML_END));
 
-    let index_path = options.output_dir.join("index.html");
+    let index_path = options.output_dir.join(path);
     let mut writer = BufWriter::new(File::create(index_path).unwrap());
 
     for s in html {

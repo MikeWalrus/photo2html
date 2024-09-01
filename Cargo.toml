@@ -7,4 +7,5 @@ edition = "2021"
 chrono = "0.4.38"
 clap = { version = "4.5.16", features = ["derive"] }
 inotify = "0.11.0"
+itertools = "0.13.0"
 kamadak-exif = { version = "0.5.5", default-features = false }
