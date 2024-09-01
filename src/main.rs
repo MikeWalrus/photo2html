@@ -196,7 +196,7 @@ fn generate(options: &Options) {
                 format!("{:?}", start_date)
             };
             let path = page_path(index);
-            format!("<li><a href=\"{path}\">{text}</a></li>\n")
+            format!("<li><a href=\"{path}\" class=\"page_{index}\">{text}</a></li>\n")
         }))
         .chain(iter::once("</ul>\n".to_owned()))
         .collect();
@@ -217,6 +217,15 @@ fn generate_page(
     nav: &str,
 ) {
     let path = page_path(index);
+    let style = format!(
+        "<style>
+a.page_{index} {{
+    font-weight: bold;
+    color: gray;
+}}
+</style>
+"
+    );
     let body: Vec<_> = photos_by_day
         .iter()
         .map(|(date, v)| {
@@ -240,10 +249,10 @@ fn generate_page(
 
     let body: Vec<String> = body.into_iter().map(|(_, i)| i).flatten().collect();
 
-    let html = iter::once(HTML_BEGIN)
+    let html = [HTML_BEGIN, style.as_str(), "<body>\n"]
+        .into_iter()
         .chain(body.iter().map(|s| &**s))
-        .chain(iter::once(nav))
-        .chain(iter::once(HTML_END));
+        .chain(["</body>", nav, HTML_END].into_iter());
 
     let index_path = options.output_dir.join(path);
     let mut writer = BufWriter::new(File::create(index_path).unwrap());
@@ -301,12 +310,10 @@ const HTML_BEGIN: &'static str = r##"
     <meta name="theme-color" content="#ffffff">
 </head>
 
-<body>
 "##;
 
 const HTML_END: &'static str = r##"
 
-</body>
 
 </html>
 
