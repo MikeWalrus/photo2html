@@ -121,7 +121,7 @@ impl Photo {
             &options.img_dir
         }
         .join(filename)
-        .with_extension("avif");
+        .with_extension("jpg");
         if output_path.exists() {
             let generate_time = output_path.metadata().unwrap().modified().unwrap();
             let photo_time = input.metadata().unwrap().modified().unwrap();
@@ -172,9 +172,11 @@ fn generate(options: &Options) {
     let mut photos_by_day: Vec<_> = photos_by_day.into_iter().collect();
     photos_by_day.sort_by_key(|k| Reverse(k.0));
 
+    dbg!(&photos_by_day);
+
     let mut page_num_photo = 0;
     const MAX_NUM_PHOTO_PER_PAGE: usize = 50;
-    let pages = photos_by_day.split(|(_, v)| {
+    let pages: Vec<&[(NaiveDate, Vec<Photo>)]> = photos_by_day.split_inclusive(|(_, v)| {
         page_num_photo += v.len();
         if page_num_photo > MAX_NUM_PHOTO_PER_PAGE {
             page_num_photo = v.len();
@@ -182,11 +184,14 @@ fn generate(options: &Options) {
         } else {
             false
         }
-    });
-    let (pages_, pages) = pages.tee();
+    }).collect();
+
+    assert_eq!(pages.iter().map(|s| s.len()).sum::<usize>(), photos_by_day.len());
+
+    dbg!(&pages);
 
     let nav: String = iter::once("<hr>\n<ul class=\"nav\">\n".to_owned())
-        .chain(pages_.enumerate().map(|(index, page)| {
+        .chain(pages.iter().enumerate().map(|(index, page)| {
             let (start_date, _) = page.last().unwrap();
             let (end_date, _) = page.first().unwrap();
             let text = if start_date < end_date {
@@ -201,7 +206,7 @@ fn generate(options: &Options) {
         .chain(iter::once("</ul>\n".to_owned()))
         .collect();
 
-    for (index, photos_by_day) in pages.enumerate() {
+    for (index, photos_by_day) in pages.iter().enumerate() {
         generate_page(photos_by_day, options, index, &nav);
     }
 }
