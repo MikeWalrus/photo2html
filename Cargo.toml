@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.98"
 chrono = "0.4.38"
 clap = { version = "4.5.16", features = ["derive"] }
 inotify = "0.11.0"

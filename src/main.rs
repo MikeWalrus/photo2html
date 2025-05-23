@@ -1,4 +1,4 @@
-#![feature(path_add_extension)]
+// #![feature(path_add_extension)]
 
 use std::{
     cmp::Reverse,
@@ -10,6 +10,7 @@ use std::{
     process::Command,
 };
 
+use anyhow::{Context, Error, Result};
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use clap::Parser;
 use exif::{In, Tag, Value};
@@ -76,14 +77,16 @@ struct Photo {
 }
 
 impl Photo {
-    fn new(path: PathBuf, options: &Options) -> Self {
-        let file = File::open(&path).unwrap();
+    fn try_new(path: PathBuf, options: &Options) -> Result<Self> {
+        let file = File::open(&path)?;
         let mut buf_reader = BufReader::new(file);
         let exif_reader = exif::Reader::new();
-        let exif = exif_reader.read_from_container(&mut buf_reader).unwrap();
+        let exif = exif_reader
+            .read_from_container(&mut buf_reader)
+            .with_context(|| path.to_string_lossy().into_owned())?;
         let datetime = &exif
             .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-            .expect(&format!("{:?} has no DateTimeOriginal", path))
+            .context(format!("{:?} has no DateTimeOriginal", path))?
             .value;
         let offset = &exif
             .get_field(Tag::OffsetTimeOriginal, In::PRIMARY)
@@ -96,12 +99,12 @@ impl Photo {
         let thumbnail_path = Self::generate_image::<true>(&path, options);
         let img_path = Self::generate_image::<false>(&path, options);
 
-        return Self {
+        return Ok(Self {
             original_path: path,
             datetime,
             thumbnail_path,
             img_path,
-        };
+        });
 
         fn ascii_to_string(v: &Value) -> String {
             if let Value::Ascii(date) = v {
@@ -151,13 +154,14 @@ impl Photo {
 fn generate(options: &Options) {
     let entries = fs::read_dir(&options.input_dir).unwrap();
 
-    let photos: Vec<Photo> = entries
+    let (photos, failed): (Vec<Photo>, Vec<Error>) = entries
         .map(|e| {
             let path = e.unwrap().path();
-            Photo::new(path, &options)
+            Photo::try_new(path, &options)
         })
-        .collect();
+        .partition_result();
     dbg!(&photos);
+    dbg!(&failed);
 
     let mut photos_by_day: HashMap<NaiveDate, Vec<Photo>> = HashMap::new();
 
