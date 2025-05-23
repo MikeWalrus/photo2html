@@ -83,7 +83,7 @@ impl Photo {
         let exif = exif_reader.read_from_container(&mut buf_reader).unwrap();
         let datetime = &exif
             .get_field(Tag::DateTimeOriginal, In::PRIMARY)
-            .unwrap()
+            .expect(&format!("{:?} has no DateTimeOriginal", path))
             .value;
         let offset = &exif
             .get_field(Tag::OffsetTimeOriginal, In::PRIMARY)
@@ -130,7 +130,10 @@ impl Photo {
             }
         }
         let mut command = Command::new("magick");
-        command.arg(input.as_os_str()).arg("-strip");
+        command
+            .arg(input.as_os_str())
+            .arg("-auto-orient")
+            .arg("-strip");
         if THUMBNAIL {
             command.arg("-quality").arg("65%").arg("-resize").arg("512");
         }
@@ -176,17 +179,22 @@ fn generate(options: &Options) {
 
     let mut page_num_photo = 0;
     const MAX_NUM_PHOTO_PER_PAGE: usize = 50;
-    let pages: Vec<&[(NaiveDate, Vec<Photo>)]> = photos_by_day.split_inclusive(|(_, v)| {
-        page_num_photo += v.len();
-        if page_num_photo > MAX_NUM_PHOTO_PER_PAGE {
-            page_num_photo = v.len();
-            true
-        } else {
-            false
-        }
-    }).collect();
+    let pages: Vec<&[(NaiveDate, Vec<Photo>)]> = photos_by_day
+        .split_inclusive(|(_, v)| {
+            page_num_photo += v.len();
+            if page_num_photo > MAX_NUM_PHOTO_PER_PAGE {
+                page_num_photo = v.len();
+                true
+            } else {
+                false
+            }
+        })
+        .collect();
 
-    assert_eq!(pages.iter().map(|s| s.len()).sum::<usize>(), photos_by_day.len());
+    assert_eq!(
+        pages.iter().map(|s| s.len()).sum::<usize>(),
+        photos_by_day.len()
+    );
 
     dbg!(&pages);
 
