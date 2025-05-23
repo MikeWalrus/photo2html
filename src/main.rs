@@ -34,6 +34,7 @@ struct Options {
     output_dir: PathBuf,
     thumbnail_dir: PathBuf,
     img_dir: PathBuf,
+    error_log: PathBuf,
 }
 
 impl From<Args> for Options {
@@ -51,11 +52,13 @@ impl From<Args> for Options {
                 create_dir_all(&d).unwrap();
             }
         }
+        let error_log = output_dir.join("error.log");
         Self {
             input_dir,
             output_dir,
             thumbnail_dir,
             img_dir,
+            error_log,
         }
     }
 }
@@ -162,6 +165,14 @@ fn generate(options: &Options) {
         .partition_result();
     dbg!(&photos);
     dbg!(&failed);
+    let mut error_log = File::options()
+        .append(true)
+        .create(true)
+        .open(&options.error_log)
+        .unwrap();
+    for e in failed {
+        writeln!(error_log, "{:#?}", e).unwrap();
+    }
 
     let mut photos_by_day: HashMap<NaiveDate, Vec<Photo>> = HashMap::new();
 
