@@ -179,21 +179,37 @@ impl Video {
     }
 
     fn extract_datetime(path: &Path) -> Result<NaiveDateTime> {
+        // Prefer com.apple.quicktime.creationdate: carries local time + UTC offset (like EXIF
+        // DateTimeOriginal + OffsetTimeOriginal), so the date is correct regardless of the
+        // machine's timezone. creation_time is UTC and can land on the wrong local day.
+        // We scan all tags rather than returning on the first match because creation_time
+        // appears before com.apple.quicktime.creationdate in the container.
         let output = Command::new("ffprobe")
             .args([
                 "-v", "quiet",
-                "-print_format", "default=noprint_wrappers=1:nokey=1",
-                "-show_entries", "format_tags=creation_time",
+                "-print_format", "default=noprint_wrappers=1",
+                "-show_entries", "format_tags",
             ])
             .arg(path)
             .output()
             .context("ffprobe failed")?;
         let s = String::from_utf8(output.stdout)?;
-        let s = s.trim().trim_end_matches('Z');
-        let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
-            .with_context(|| format!("failed to parse datetime {:?} from {:?}", s, path))?;
-        // creation_time from ffprobe is UTC; convert to local to sort consistently with photos
-        Ok(Utc.from_utc_datetime(&naive).with_timezone(&Local).naive_local())
+        let mut fallback: Option<NaiveDateTime> = None;
+        for line in s.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("TAG:com.apple.quicktime.creationdate=") {
+                if let Ok(dt) = chrono::DateTime::parse_from_str(val, "%Y-%m-%dT%H:%M:%S%z") {
+                    return Ok(dt.naive_local());
+                }
+            }
+            if let Some(val) = line.strip_prefix("TAG:creation_time=") {
+                let val = val.trim_end_matches('Z');
+                if let Ok(naive) = NaiveDateTime::parse_from_str(val, "%Y-%m-%dT%H:%M:%S%.f") {
+                    fallback = Some(Utc.from_utc_datetime(&naive).with_timezone(&Local).naive_local());
+                }
+            }
+        }
+        fallback.with_context(|| format!("no datetime found in {:?}", path))
     }
 
     fn generate_thumbnail(input: &Path, options: &Options) -> Result<PathBuf> {
@@ -456,12 +472,11 @@ const HTML_BEGIN: &'static str = r##"
     <link rel="icon" href="/favicon.ico" sizes="any">
     <link rel="icon" href="/icon.svg" type="image/svg+xml">
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-    <link rel="manifest" href="/site.webmanifest">
     <meta name="theme-color" content="#ffffff">
     <style>
 figure.video-thumb { position: relative; }
 figure.video-thumb::after {
-    content: "▶";
+    content: "\25B6\FE0E";
     position: absolute;
     top: 50%;
     left: 50%;
