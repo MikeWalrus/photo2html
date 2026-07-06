@@ -11,11 +11,14 @@ use std::{
 };
 
 use anyhow::{Context, Error, Result};
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{FixedOffset, Local, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use clap::Parser;
 use exif::{In, Tag, Value};
 use inotify::{Inotify, WatchMask};
 use itertools::Itertools as _;
+
+const PHOTO_EXTENSIONS: &[&str] = &["jpg", "jpeg", "png", "heic", "heif", "tiff", "tif", "webp", "dng"];
+const VIDEO_EXTENSIONS: &[&str] = &["mov", "mp4", "m4v", "hevc"];
 
 #[derive(Parser)]
 struct Args {
@@ -34,6 +37,7 @@ struct Options {
     output_dir: PathBuf,
     thumbnail_dir: PathBuf,
     img_dir: PathBuf,
+    video_dir: PathBuf,
 }
 
 impl From<Args> for Options {
@@ -46,7 +50,8 @@ impl From<Args> for Options {
         };
         let thumbnail_dir = output_dir.join("thumbnail");
         let img_dir = output_dir.join("img");
-        for d in [&thumbnail_dir, &img_dir] {
+        let video_dir = output_dir.join("video");
+        for d in [&thumbnail_dir, &img_dir, &video_dir] {
             if !d.exists() {
                 create_dir_all(&d).unwrap();
             }
@@ -56,6 +61,7 @@ impl From<Args> for Options {
             output_dir,
             thumbnail_dir,
             img_dir,
+            video_dir,
         }
     }
 }
@@ -151,43 +157,165 @@ impl Photo {
     }
 }
 
+#[derive(Debug)]
+struct Video {
+    original_path: PathBuf,
+    datetime: NaiveDateTime,
+    thumbnail_path: PathBuf,
+    video_path: PathBuf,
+}
+
+impl Video {
+    fn try_new(path: PathBuf, options: &Options) -> Result<Self> {
+        let datetime = Self::extract_datetime(&path)?;
+        let thumbnail_path = Self::generate_thumbnail(&path, options)?;
+        let video_path = Self::transcode(&path, options)?;
+        Ok(Self {
+            original_path: path,
+            datetime,
+            thumbnail_path,
+            video_path,
+        })
+    }
+
+    fn extract_datetime(path: &Path) -> Result<NaiveDateTime> {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v", "quiet",
+                "-print_format", "default=noprint_wrappers=1:nokey=1",
+                "-show_entries", "format_tags=creation_time",
+            ])
+            .arg(path)
+            .output()
+            .context("ffprobe failed")?;
+        let s = String::from_utf8(output.stdout)?;
+        let s = s.trim().trim_end_matches('Z');
+        let naive = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+            .with_context(|| format!("failed to parse datetime {:?} from {:?}", s, path))?;
+        // creation_time from ffprobe is UTC; convert to local to sort consistently with photos
+        Ok(Utc.from_utc_datetime(&naive).with_timezone(&Local).naive_local())
+    }
+
+    fn generate_thumbnail(input: &Path, options: &Options) -> Result<PathBuf> {
+        let output_path = options
+            .thumbnail_dir
+            .join(input.file_name().unwrap())
+            .with_extension("jpg");
+        if output_path.exists() {
+            let gen_time = output_path.metadata()?.modified()?;
+            let src_time = input.metadata()?.modified()?;
+            if gen_time > src_time {
+                return Ok(output_path);
+            }
+        }
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(input)
+            .args(["-vframes", "1", "-ss", "1", "-q:v", "2"])
+            .arg(&output_path)
+            .status()
+            .context("ffmpeg failed")?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg thumbnail extraction failed for {:?}", input);
+        }
+        Ok(output_path)
+    }
+
+    fn transcode(input: &Path, options: &Options) -> Result<PathBuf> {
+        let output_path = options
+            .video_dir
+            .join(input.file_name().unwrap())
+            .with_extension("mp4");
+        if output_path.exists() {
+            let gen_time = output_path.metadata()?.modified()?;
+            let src_time = input.metadata()?.modified()?;
+            if gen_time > src_time {
+                return Ok(output_path);
+            }
+        }
+        let status = Command::new("ffmpeg")
+            .args(["-y", "-i"])
+            .arg(input)
+            .args([
+                "-c:v", "libx264",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+            ])
+            .arg(&output_path)
+            .status()
+            .context("ffmpeg failed")?;
+        if !status.success() {
+            anyhow::bail!("ffmpeg transcode failed for {:?}", input);
+        }
+        Ok(output_path)
+    }
+}
+
+#[derive(Debug)]
+enum Media {
+    Photo(Photo),
+    Video(Video),
+}
+
+impl Media {
+    fn try_new(path: PathBuf, options: &Options) -> Result<Self> {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
+            Some(e) if PHOTO_EXTENSIONS.contains(&e) => {
+                Photo::try_new(path, options).map(Media::Photo)
+            }
+            Some(e) if VIDEO_EXTENSIONS.contains(&e) => {
+                Video::try_new(path, options).map(Media::Video)
+            }
+            _ => Err(anyhow::anyhow!("unsupported file type: {:?}", path)),
+        }
+    }
+
+    fn datetime(&self) -> NaiveDateTime {
+        match self {
+            Media::Photo(p) => p.datetime,
+            Media::Video(v) => v.datetime,
+        }
+    }
+}
+
 fn generate(options: &Options) {
     let entries = fs::read_dir(&options.input_dir).unwrap();
 
-    let (photos, failed): (Vec<Photo>, Vec<Error>) = entries
+    let (media, failed): (Vec<Media>, Vec<Error>) = entries
         .map(|e| {
             let path = e.unwrap().path();
-            Photo::try_new(path, &options)
+            Media::try_new(path, &options)
         })
         .partition_result();
-    dbg!(&photos);
+    dbg!(&media);
     dbg!(&failed);
 
-    let mut photos_by_day: HashMap<NaiveDate, Vec<Photo>> = HashMap::new();
+    let mut media_by_day: HashMap<NaiveDate, Vec<Media>> = HashMap::new();
 
-    for p in photos {
-        let date = p.datetime.date();
-        photos_by_day.entry(date).or_insert(Vec::new()).push(p);
+    for m in media {
+        let date = m.datetime().date();
+        media_by_day.entry(date).or_insert(Vec::new()).push(m);
     }
 
-    for v in photos_by_day.values_mut() {
-        v.sort_by_key(|p| Reverse(p.datetime))
+    for v in media_by_day.values_mut() {
+        v.sort_by_key(|m| Reverse(m.datetime()))
     }
 
-    dbg!(&photos_by_day);
+    let mut media_by_day: Vec<_> = media_by_day.into_iter().collect();
+    media_by_day.sort_by_key(|k| Reverse(k.0));
 
-    let mut photos_by_day: Vec<_> = photos_by_day.into_iter().collect();
-    photos_by_day.sort_by_key(|k| Reverse(k.0));
-
-    dbg!(&photos_by_day);
-
-    let mut page_num_photo = 0;
-    const MAX_NUM_PHOTO_PER_PAGE: usize = 50;
-    let pages: Vec<&[(NaiveDate, Vec<Photo>)]> = photos_by_day
+    let mut page_num_media = 0;
+    const MAX_NUM_MEDIA_PER_PAGE: usize = 50;
+    let pages: Vec<&[(NaiveDate, Vec<Media>)]> = media_by_day
         .split_inclusive(|(_, v)| {
-            page_num_photo += v.len();
-            if page_num_photo > MAX_NUM_PHOTO_PER_PAGE {
-                page_num_photo = v.len();
+            page_num_media += v.len();
+            if page_num_media > MAX_NUM_MEDIA_PER_PAGE {
+                page_num_media = v.len();
                 true
             } else {
                 false
@@ -197,7 +325,7 @@ fn generate(options: &Options) {
 
     assert_eq!(
         pages.iter().map(|s| s.len()).sum::<usize>(),
-        photos_by_day.len()
+        media_by_day.len()
     );
 
     dbg!(&pages);
@@ -218,8 +346,8 @@ fn generate(options: &Options) {
         .chain(iter::once("</ul>\n".to_owned()))
         .collect();
 
-    for (index, photos_by_day) in pages.iter().enumerate() {
-        generate_page(photos_by_day, options, index, &nav);
+    for (index, media_by_day) in pages.iter().enumerate() {
+        generate_page(media_by_day, options, index, &nav);
     }
 }
 
@@ -228,7 +356,7 @@ fn page_path(index: usize) -> String {
 }
 
 fn generate_page(
-    photos_by_day: &[(NaiveDate, Vec<Photo>)],
+    media_by_day: &[(NaiveDate, Vec<Media>)],
     options: &Options,
     index: usize,
     nav: &str,
@@ -243,7 +371,7 @@ a.page_{index} {{
 </style>
 "
     );
-    let body: Vec<_> = photos_by_day
+    let body: Vec<_> = media_by_day
         .iter()
         .map(|(date, v)| {
             (
@@ -252,12 +380,17 @@ a.page_{index} {{
                     "<h2>{:?}</h2>\n<div class=\"masonry-grid\">\n",
                     date
                 ))
-                .chain(v.iter().map(|p| {
-                    format!(
+                .chain(v.iter().map(|m| match m {
+                    Media::Photo(p) => format!(
                         "<figure><a href=\"{}\"><img src=\"./{}\"></figure></a>\n",
                         options.relative_path(&p.img_path).to_str().unwrap(),
                         options.relative_path(&p.thumbnail_path).to_str().unwrap()
-                    )
+                    ),
+                    Media::Video(vid) => format!(
+                        "<figure class=\"video-thumb\"><a href=\"{}\"><img src=\"./{}\"></figure></a>\n",
+                        options.relative_path(&vid.video_path).to_str().unwrap(),
+                        options.relative_path(&vid.thumbnail_path).to_str().unwrap()
+                    ),
                 }))
                 .chain(iter::once(format!("</div>\n"))),
             )
@@ -325,6 +458,20 @@ const HTML_BEGIN: &'static str = r##"
     <link rel="apple-touch-icon" href="/apple-touch-icon.png">
     <link rel="manifest" href="/site.webmanifest">
     <meta name="theme-color" content="#ffffff">
+    <style>
+figure.video-thumb { position: relative; }
+figure.video-thumb::after {
+    content: "▶";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    font-size: 2.5rem;
+    color: white;
+    text-shadow: 0 0 6px rgba(0, 0, 0, .75);
+    pointer-events: none;
+}
+    </style>
 </head>
 
 "##;
